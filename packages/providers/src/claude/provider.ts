@@ -579,12 +579,22 @@ function buildBaseClaudeOptions(
     'claude.subprocess_env_file_flag'
   );
 
+  // When FACTORY_MCP_STRICT=true is in the server's environment, pass
+  // --strict-mcp-config to every Claude subprocess. This suppresses
+  // user-level claude.ai connector loading (Gmail, Calendar, Drive, ClickUp)
+  // so factory workflows can't accidentally pull from the operator's chat
+  // account connector set. Leaves non-factory Archon use unaffected.
+  const strictMcp = process.env.FACTORY_MCP_STRICT === 'true';
+  const baseExecArgs: string[] = [];
+  if (isJsExecutable) baseExecArgs.push('--no-env-file');
+  if (strictMcp) baseExecArgs.push('--strict-mcp-config');
+
   return {
     cwd,
     // In compiled binaries, the resolver supplies an absolute executable path;
     // in dev mode it returns undefined and the SDK resolves from node_modules.
     ...(cliPath !== undefined ? { pathToClaudeCodeExecutable: cliPath } : {}),
-    ...(isJsExecutable ? { executableArgs: ['--no-env-file'] } : {}),
+    ...(baseExecArgs.length > 0 ? { executableArgs: baseExecArgs } : {}),
     env,
     model: requestOptions?.model ?? assistantDefaults.model,
     abortController: controller,
