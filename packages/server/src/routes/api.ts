@@ -7,9 +7,10 @@ import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
 import { rm, readFile, writeFile, unlink, mkdir } from 'fs/promises';
-import { readFileSync } from 'fs';
+import { readFileSync, openSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
 import { randomUUID } from 'crypto';
+import { spawn } from 'node:child_process';
 import type { Context } from 'hono';
 import type {
   ConversationLockManager,
@@ -554,6 +555,49 @@ const runWorkflowRoute = createRoute({
     200: {
       content: { 'application/json': { schema: dispatchResponseSchema } },
       description: 'Accepted',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const runHeadlessBodySchema = z
+  .object({
+    message: z.string(),
+    cwd: z.string(),
+  })
+  .openapi('RunHeadlessBody');
+
+const runHeadlessResponseSchema = z
+  .object({
+    runId: z.string(),
+    pid: z.number(),
+    logPath: z.string(),
+    status: z.string(),
+  })
+  .openapi('RunHeadlessResponse');
+
+const runHeadlessWorkflowRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/{name}/run-headless',
+  tags: ['Workflows'],
+  summary:
+    'Run a workflow headlessly (fire-and-forget, detached child of server process). ' +
+    'Unlike /api/workflows/{name}/run which routes through the orchestrator and requires ' +
+    'an active conversation, this endpoint spawns the archon CLI as a detached subprocess ' +
+    'owned by the server. The server process persists so the child survives caller disconnect. ' +
+    'Suitable for cron, scripts, and remote dispatch where no chat agent is connected.',
+  request: {
+    params: z.object({ name: z.string() }),
+    body: {
+      content: { 'application/json': { schema: runHeadlessBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: runHeadlessResponseSchema } },
+      description: 'Started',
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
@@ -1739,6 +1783,60 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'run_workflow_failed');
       return apiError(c, 500, 'Failed to run workflow');
+    }
+  });
+
+  // POST /api/workflows/:name/run-headless - Fire-and-forget detached dispatch.
+  // Spawns the archon CLI as a detached child of the server process. The child
+  // inherits from the server (which runs as a persistent daemon), so it survives
+  // caller disconnect. Use this for cron, remote scripts, and any context where
+  // no chat agent (CLI/Discord/Slack/browser SSE) is connected to pick up a
+  // /workflow run command routed through dispatchToOrchestrator.
+  registerOpenApiRoute(runHeadlessWorkflowRoute, async c => {
+    const workflowName = c.req.param('name') ?? '';
+    if (!isValidCommandName(workflowName)) {
+      return apiError(c, 400, 'Invalid workflow name');
+    }
+    try {
+      const { message, cwd } = getValidatedBody(c, runHeadlessBodySchema);
+      const runId = randomUUID();
+      const logDir = '/tmp/archon-headless';
+      await mkdir(logDir, { recursive: true });
+      const logPath = `${logDir}/${runId}.log`;
+      const logFd = openSync(logPath, 'a');
+
+      // Resolve the archon CLI entry. The server's parent directory layout is:
+      //   <repo>/packages/server/src/routes/api.ts (this file)
+      //   <repo>/packages/cli/src/cli.ts (CLI entry)
+      // We spawn `bun run` against the monorepo root so workspace resolution works.
+      const repoRoot = normalize(join(import.meta.dir, '..', '..', '..', '..'));
+
+      const child = spawn(
+        'bun',
+        ['run', 'archon', 'workflow', 'run', '--cwd', cwd, workflowName, message],
+        {
+          cwd: repoRoot,
+          detached: true,
+          stdio: ['ignore', logFd, logFd],
+          env: { ...process.env },
+        }
+      );
+      child.unref();
+
+      getLog().info(
+        { runId, pid: child.pid, workflowName, cwd, logPath },
+        'headless_workflow_dispatched'
+      );
+
+      return c.json({
+        runId,
+        pid: child.pid ?? -1,
+        logPath,
+        status: 'started',
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'run_headless_workflow_failed');
+      return apiError(c, 500, 'Failed to run workflow headlessly');
     }
   });
 
