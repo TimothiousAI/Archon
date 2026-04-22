@@ -571,10 +571,6 @@ const runHeadlessBodySchema = z
     // integration branch from the product's .archon/factory-config.yaml
     // during bring-up, and the base branch in steady state.
     from_branch: z.string().optional(),
-    // Optional: bypass Archon's built-in worktree isolation. Equivalent to
-    // the CLI's --no-worktree flag. Use only for deterministic workflows
-    // that explicitly manage their own branch state (e.g. bootstrap).
-    no_worktree: z.boolean().optional(),
   })
   .openapi('RunHeadlessBody');
 
@@ -1808,12 +1804,7 @@ export function registerApiRoutes(
       return apiError(c, 400, 'Invalid workflow name');
     }
     try {
-      const {
-        message,
-        cwd,
-        from_branch: fromBranch,
-        no_worktree: noWorktree,
-      } = getValidatedBody(c, runHeadlessBodySchema);
+      const { message, cwd, from_branch: fromBranch } = getValidatedBody(c, runHeadlessBodySchema);
       const runId = randomUUID();
       const logDir = '/tmp/archon-headless';
       await mkdir(logDir, { recursive: true });
@@ -1826,12 +1817,13 @@ export function registerApiRoutes(
       // We spawn `bun run` against the monorepo root so workspace resolution works.
       const repoRoot = normalize(join(import.meta.dir, '..', '..', '..', '..'));
 
+      // Always use a worktree. Isolation is Archon-core behavior; the factory
+      // doesn't decide per-dispatch. Write workflows (implement/validate/fix)
+      // need isolation; read-only workflows (triage/phase-executor) pay ~1s of
+      // overhead per run which is immaterial at factory scale.
       const args = ['run', 'archon', 'workflow', 'run', '--cwd', cwd];
       if (fromBranch) {
         args.push('--from', fromBranch);
-      }
-      if (noWorktree) {
-        args.push('--no-worktree');
       }
       args.push(workflowName, message);
 
@@ -1844,7 +1836,7 @@ export function registerApiRoutes(
       child.unref();
 
       getLog().info(
-        { runId, pid: child.pid, workflowName, cwd, logPath, fromBranch, noWorktree },
+        { runId, pid: child.pid, workflowName, cwd, logPath, fromBranch },
         'headless_workflow_dispatched'
       );
 
